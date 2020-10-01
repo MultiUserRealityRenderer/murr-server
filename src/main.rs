@@ -1,72 +1,102 @@
-use futures::pin_mut;
-use futures::channel::mpsc;
+//use futures::channel::mpsc;
 use futures::prelude::*;
+use log::*;
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use tokio::net::TcpListener;
-use tokio::net::TcpStream;
-use tokio::prelude::*;
-use tungstenite::protocol::Message;
+use std::sync::Arc;
+use tokio::sync::{mpsc, RwLock};
+use warp::ws::{Message, WebSocket};
+use warp::Filter;
 
-type Tx = mpsc::UnboundedSender<Message>;
-type PeerMap = Arc<Mutex<HashMap<SocketAddr, Tx>>>;
-
-async fn handle_connection(peer_map: PeerMap, raw_stream: TcpStream, addr: SocketAddr) {
-    println!("Incoming connection from: {}", addr);
-
-    let ws_stream = tokio_tungstenite::accept_async(raw_stream)
-        .await
-        .expect("Error during websocket handshake");
-    println!("WebSocket connection established: {}", addr);
-
-    let (tx, rx) = mpsc::unbounded();
-    peer_map.lock().unwrap().insert(addr, tx);
-
-    let (outgoing, incoming) = ws_stream.split();
-
-    let broadcast_incoming = incoming.try_for_each(|msg| {
-        println!("From {}: {}", addr, msg.to_text().unwrap());
-        let peers = peer_map.lock().unwrap();
-
-        let broadcast_recipients = peers
-            .iter()
-            .filter(|(peer_addr, _)| peer_addr != &&addr)
-            .map(|(_, sink)| sink);
-        for recp in broadcast_recipients {
-            recp.unbounded_send(msg.clone()).unwrap();
-        }
-
-        future::ok(())
-    });
-
-    let receive_from_others = rx.map(Ok).forward(outgoing);
-
-    pin_mut!(broadcast_incoming, receive_from_others);
-    future::select(broadcast_incoming, receive_from_others).await;
-
-    println!("{} disconnected", &addr);
-    peer_map.lock().unwrap().remove(&addr);
-}
+type Users = Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<Result<Message, warp::Error>>>>>;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::init();
+    pretty_env_logger::init();
 
+    // Default to an odd port for now
     let addr = env::args()
         .nth(1)
-        .unwrap_or_else(|| "127.0.0.1:6418".to_string());
-    let state = PeerMap::new(Mutex::new(HashMap::new()));
+        .unwrap_or_else(|| "[::]:6418".to_string());
+    println!("Listening on {}", addr);
 
-    let sock = TcpListener::bind(&addr).await;
-    let mut listener = sock.expect("Failed to bind");
-    println!("Listening on: {}", addr);
+    // Connected users state
+    let users = Users::default();
+    // turn it into a "filter"
+    let users = warp::any().map(move || users.clone());
 
-    while let Ok((stream, addr)) = listener.accept().await {
-        tokio::spawn(handle_connection(state.clone(), stream, addr));
-    }
+    // GET /ws -> WebSocket upgrade
+    let ws = warp::path("ws")
+        .and(warp::ws())
+        .and(users)
+        .and(warp::addr::remote())
+        .map(|ws: warp::ws::Ws, users, address: Option<SocketAddr>| {
+            // Will call the function if upgrade succeeds
+            ws.on_upgrade(move |socket| user_connected(socket, users, address.unwrap()))
+        });
+
+    // replace w/ a redirect to static domain?
+    // GET / -> static HTML
+    let index = warp::path::end().map(|| warp::reply::html(INDEX_HTML));
+
+    // Route aggregation
+    let routes = index.or(ws);
+
+    warp::serve(routes).run(addr.parse::<SocketAddr>()?).await;
 
     Ok(())
 }
+
+async fn user_connected(ws: WebSocket, users: Users, addr: SocketAddr) {
+    // noop
+    info!("New user: {}", addr);
+
+    // Split the websocket
+    let (user_tx, user_rx) = ws.split();
+
+    // Create a channel to recieve messages from other users...
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    // Spawn the task to move messages to the socket
+    tokio::task::spawn(rx.forward(user_tx).map(|result| {
+        if let Err(e) = result {
+            info!("websocket send error: {}", e);
+        }
+    }));
+
+    // Insert the user in the list of users
+    users.write().await.insert(addr, tx);
+
+    let result = user_rx
+        .for_each(|msg| user_message(addr, msg.unwrap(), &users))
+        .await;
+
+    info!("user disconnected: {}, {:?}", addr, result);
+    users.write().await.remove(&addr);
+}
+
+async fn user_message(my_addr: SocketAddr, msg: Message, users: &Users) {
+    // Skip any non-Text messages...
+    let msg = if let Ok(s) = msg.to_str() {
+        s
+    } else {
+        return;
+    };
+
+    let new_msg = format!("<User#{}>: {}", my_addr, msg);
+
+    // New message from this user, send it to everyone else
+    for (&addr, tx) in users.read().await.iter() {
+        if my_addr != addr {
+            if let Err(_disconnected) = tx.send(Ok(Message::text(new_msg.clone()))) {
+                // The tx is disconnected, our `user_disconnected` code
+                // should be happening in another task, nothing more to
+                // do here.
+            }
+        }
+    }
+}
+
+static INDEX_HTML: &str = include_str!("index.html");
